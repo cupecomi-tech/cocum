@@ -12592,6 +12592,132 @@ add_action('load-edit.php', function() {
     }
 });
 
+
+/**
+ * Indicador discreto del estado del cron en Reporte Diario.
+ */
+add_action('admin_footer', function () {
+
+    $screen = function_exists('get_current_screen') ? get_current_screen() : null;
+
+    if (!$screen || $screen->post_type !== 'reporte_diario') {
+        return;
+    }
+
+    $registro = get_option('cocum_cron_reporte_diario_ultima_ejecucion', array());
+
+    $fecha_ultima = isset($registro['fecha_hora'])
+        ? (string) $registro['fecha_hora']
+        : '';
+
+    $usuarios = isset($registro['usuarios_procesados'])
+        ? intval($registro['usuarios_procesados'])
+        : 0;
+
+    $estado = ' ';
+    $color = '#d63638';
+    $fondo = '#fbeaea';
+    $minutos = null;
+
+    if ($fecha_ultima !== '') {
+
+        $zona_horaria = wp_timezone();
+
+        $ultima_ejecucion = DateTime::createFromFormat(
+            'Y-m-d H:i:s',
+            $fecha_ultima,
+            $zona_horaria
+        );
+
+        $ahora = new DateTime('now', $zona_horaria);
+
+        if ($ultima_ejecucion) {
+
+            $segundos = max(
+                0,
+                $ahora->getTimestamp() - $ultima_ejecucion->getTimestamp()
+            );
+
+            $minutos = floor($segundos / 60);
+
+            if ($minutos <= 15) {
+                $estado = 'Cron funcionando';
+                $color = '#008a20';
+                $fondo = '#edfaef';
+
+            } elseif ($minutos <= 30) {
+                $estado = 'Cron retrasado';
+                $color = '#996800';
+                $fondo = '#fff8df';
+
+            } else {
+                $estado = 'Cron sin ejecución reciente';
+                $color = '#d63638';
+                $fondo = '#fbeaea';
+            }
+        }
+    }
+
+    $fecha_mostrar = 'Sin registro';
+
+    if ($fecha_ultima !== '') {
+        $fecha_objeto = DateTime::createFromFormat(
+            'Y-m-d H:i:s',
+            $fecha_ultima,
+            wp_timezone()
+        );
+
+        if ($fecha_objeto) {
+            $fecha_mostrar = $fecha_objeto->format('d/m/Y H:i:s');
+        }
+    }
+    ?>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function () {
+
+        const tabla = document.querySelector('.wp-list-table');
+
+        if (!tabla || document.getElementById('cocum-estado-cron')) {
+            return;
+        }
+
+        const indicador = document.createElement('div');
+
+        indicador.id = 'cocum-estado-cron';
+
+        indicador.style.cssText = [
+            'display:inline-flex',
+            'align-items:center',
+            'gap:6px',
+            'margin-top:8px',
+            'padding:5px 9px',
+            'font-size:11px',
+            'line-height:1.3',
+            'border-radius:5px',
+            'border:1px solid <?php echo esc_js($color); ?>',
+            'background:<?php echo esc_js($fondo); ?>',
+            'color:<?php echo esc_js($color); ?>'
+        ].join(';');
+
+        indicador.innerHTML =
+            '<span style="font-size:14px;">●</span>' +
+            '<strong><?php echo esc_js($estado); ?></strong>' +
+            '<span>· Última ejecución: <?php echo esc_js($fecha_mostrar); ?></span>' +
+            '<span>· Usuarios: <?php echo intval($usuarios); ?></span>' +
+            <?php if ($minutos !== null) : ?>
+            '<span>· Hace <?php echo intval($minutos); ?> min</span>';
+            <?php else : ?>
+            '<span>· Sin actividad registrada</span>';
+            <?php endif; ?>
+
+        tabla.insertAdjacentElement('afterend', indicador);
+    });
+    </script>
+
+    <?php
+});
+
 // ========================================
 // 🔹 Archivo modificado por: Emmanuel Chimal
 // ========================================
