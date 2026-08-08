@@ -2164,7 +2164,12 @@ $hoy_pago          = wp_date('d/m/Y');                           // ej: "22/08/2
                                   $fecha_prox_timestamp = strtotime(str_replace('/', '-', $fecha_prox_val));
                                   $hoy_timestamp = strtotime(str_replace('/', '-', $hoy_pago));
                                   $estatus_pago_tmp = trim((string)$campos_miscuenta["estatus_pago"]);
-                                  $mostrar_cliente = ($fecha_prox_timestamp <= $hoy_timestamp) || ($estatus_pago_tmp === "");
+                                  $mostrar_cliente = cocum_cuenta_debe_cobrarse_hoy(
+                                      $idPost_cuentas,
+                                      $fecha_prox_val,
+                                      $estatus_pago_tmp,
+                                      $campos_miscuenta["cuenta"]
+                                  );
                                     ?>
 
                                       //alert("ID: <?php echo esc_js($idClienteList); ?> - Cliente: <?php echo esc_js(get_the_title($idClienteList)); ?>");
@@ -2233,6 +2238,27 @@ $hoy_pago          = wp_date('d/m/Y');                           // ej: "22/08/2
                                         
                                         jQuery("#post-" + idObjetivoRojo).css({"background-color": "rgb(255, 137, 137)"}); // rojo
                                         jQuery("#post-" + idObjetivoRojo).addClass("porCobrar"); // se requiere para control de listado
+
+                                        // Contar solamente las cuentas que realmente deben cobrarse hoy.
+                                        // Se usa la misma condición que muestra la fila roja, por lo que
+                                        // al registrar el pago y recargar, el número se actualiza solo.
+                                        window.cocumCuentasPendientesContadas = window.cocumCuentasPendientesContadas || {};
+                                        var idCuentaPendiente = "<?php echo esc_js($idPost_cuentas); ?>";
+                                        if (!window.cocumCuentasPendientesContadas[idCuentaPendiente]) {
+                                            window.cocumCuentasPendientesContadas[idCuentaPendiente] = true;
+
+                                            var filaCliente = jQuery("#post-" + idObjetivoRojo);
+                                            var cantidadPendiente = parseInt(filaCliente.attr("data-cocum-por-cobrar") || "0", 10) + 1;
+                                            filaCliente.attr("data-cocum-por-cobrar", cantidadPendiente);
+
+                                            var celdaTitulo = filaCliente.find("td.title.column-title").first();
+                                            var etiquetaPendiente = celdaTitulo.find(".cocum-cuentas-por-cobrar");
+                                            if (!etiquetaPendiente.length) {
+                                                etiquetaPendiente = jQuery('<span class="cocum-cuentas-por-cobrar" style="color:#8a2424;font-size:11px;font-weight:600;white-space:nowrap;"></span>');
+                                                celdaTitulo.find("a.row-title").first().after(etiquetaPendiente);
+                                            }
+                                            etiquetaPendiente.text(" (" + cantidadPendiente + " por cobrar)");
+                                        }
 
                                         // 🪄 CORRECCIÓN VISUAL: Si la fila es roja, el estatus NO puede ser "terminado"
                                         // Buscamos en las celdas de esta fila y cambiamos el texto si dice terminado
@@ -2921,6 +2947,55 @@ add_action('cocum_cron_reporte_diario_10min', 'cocum_ejecutar_cron_backfill_repo
 add_action('cocum_cron_backfill_reporte_diario', 'cocum_ejecutar_cron_backfill_reporte_diario');
 
 /**
+ * Regla central para decidir si una cuenta debe cobrarse hoy.
+ * Una cuenta creada hoy comienza a cobrarse a partir del día siguiente.
+ */
+function cocum_cuenta_debe_cobrarse_hoy($miscuenta_id, $fecha_prox_cobro = '', $estatus_pago = '', $estado_cuenta = '') {
+    $miscuenta_id = intval($miscuenta_id);
+    if ($miscuenta_id <= 0) {
+        return false;
+    }
+
+    $estado_cuenta = strtolower(trim((string) $estado_cuenta));
+    if ($estado_cuenta === '') {
+        $estado_cuenta = strtolower(trim((string) get_post_meta($miscuenta_id, 'cuenta', true)));
+    }
+    if ($estado_cuenta === '') {
+        $estado_cuenta = strtolower(trim((string) get_field('cuenta', $miscuenta_id)));
+    }
+    if ($estado_cuenta !== 'activa') {
+        return false;
+    }
+
+    $hoy_ymd = wp_date('Y-m-d');
+    $cliente_id = intval(get_post_meta($miscuenta_id, 'id_cliente_cuenta', true));
+    if ($cliente_id <= 0) {
+        $cliente_id = intval(get_field('id_cliente_cuenta', $miscuenta_id));
+    }
+
+    $post_fecha_id = $cliente_id > 0 ? $cliente_id : $miscuenta_id;
+    $fecha_alta_ymd = get_the_date('Y-m-d', $post_fecha_id);
+    if ($fecha_alta_ymd !== '' && $fecha_alta_ymd >= $hoy_ymd) {
+        return false;
+    }
+
+    if ($fecha_prox_cobro === '' || $fecha_prox_cobro === null) {
+        $fecha_prox_cobro = get_post_meta($miscuenta_id, 'fecha_prox_cobro', true);
+    }
+    if ($fecha_prox_cobro === '' || $fecha_prox_cobro === null) {
+        $fecha_prox_cobro = get_field('fecha_prox_cobro', $miscuenta_id);
+    }
+
+    $fecha_prox_ymd = cocum_normalizar_fecha_ymd($fecha_prox_cobro);
+    if ($fecha_prox_ymd !== '') {
+        return $fecha_prox_ymd <= $hoy_ymd;
+    }
+
+    // Compatibilidad con cuentas antiguas que no tienen próxima fecha guardada.
+    return trim((string) $estatus_pago) === '';
+}
+
+/**
  * Actualiza "cobrar_dia_actual" y "clientes_con_pagos" en filas de reporte_diario
  * que quedaron en cero porque nadie entró al sistema ese día.
  * Función heredada. Ya no se llama desde el cron porque usa estados actuales y
@@ -3046,9 +3121,11 @@ function cocum_calcular_cobranza_actual_usuario($user_id) {
         $fecha_prox_timestamp = $fecha_prox_ymd !== '' ? strtotime($fecha_prox_ymd) : false;
 
         // Misma regla utilizada por el listado gd_place de Clientes a Cobrar.
-        $debe_cobrar_hoy = (
-            ($fecha_prox_timestamp !== false && $fecha_prox_timestamp <= $hoy_timestamp) ||
-            $estatus_pago === ''
+        $debe_cobrar_hoy = cocum_cuenta_debe_cobrarse_hoy(
+            $miscuenta_id,
+            $fecha_prox_cobro,
+            $estatus_pago,
+            $estado_cuenta
         );
         if (!$debe_cobrar_hoy) {
             continue;
@@ -4063,18 +4140,12 @@ function reporte_diario(){
     
 }
  
-/**
- * 🛠️ EJECUCIÓN DE CÁLCULOS DEL REPORTE DIARIO
- * Se movió al inicio de la carga para que los valores se reflejen inmediatamente en la tabla.
+/*
+ * La ejecución antigua de load-edit.php fue retirada porque repetía
+ * cocum_backfill_reporte_diario_usuario() y reporte_diario().
+ * El controlador más reciente, ubicado al final del archivo, conserva ambas
+ * operaciones y también mantiene la revisión de fechas e historial.
  */
-add_action('load-edit.php', function() {
-    $screen = get_current_screen();
-    if ($screen && $screen->post_type === 'reporte_diario') {
-        // Antes de calcular el día actual, asegurar que no existan saltos en días anteriores.
-        cocum_backfill_reporte_diario_usuario(get_current_user_id());
-        reporte_diario();
-    }
-});
  
 
 
@@ -10550,7 +10621,12 @@ function agrupar_nombres_repetidos_en_admin() {
                     $fecha_prox_raw = get_field('fecha_prox_cobro', $miscuenta_id);
                 }
                 $fecha_prox_ts = $parse_date_to_ts($fecha_prox_raw);
-                $is_pending_today = ($estado_cuenta === 'activa') && (($fecha_prox_ts > 0 && $fecha_prox_ts <= $today_ts) || $estatus_pago === '');
+                $is_pending_today = cocum_cuenta_debe_cobrarse_hoy(
+                    $miscuenta_id,
+                    $fecha_prox_raw,
+                    $estatus_pago,
+                    $estado_cuenta
+                );
 
                 if ($saldo_pendiente > 0.01 || $estado_cuenta === 'activa') {
                     $gd_financial_stats[$gd_id]['has_pending'] = true;
@@ -10864,12 +10940,14 @@ add_action('load-edit.php', function () {
     $screen = get_current_screen();
     if ( $screen->post_type !== 'reporte_diario' ) return;
 
-    // Obtener todos los posts reporte_diario publicados
+    // Obtener únicamente los reportes publicados del usuario conectado.
     $reportes = get_posts([
         'post_type'      => 'reporte_diario',
         'post_status'    => 'publish',
+        'author'         => get_current_user_id(),
         'posts_per_page' => -1,
         'fields'         => 'ids',
+        'no_found_rows'  => true,
     ]);
 
     foreach ( $reportes as $post_id ) {
