@@ -3078,15 +3078,25 @@ function cocum_rellenar_metricas_esperadas_usuario($user_id) {
  * reconstruir fotografías históricas.
  */
 function cocum_calcular_cobranza_actual_usuario($user_id) {
+    static $cache_resultados = array();
+
     $resultado = array(
         'cantidad'    => 0,
         'total_cuotas' => 0.0,
         'cuentas_ids' => array(),
+        'detalles'     => array(),
+        'observaciones' => array(),
     );
 
     $user_id = intval($user_id);
     if ($user_id <= 0) {
         return $resultado;
+    }
+
+    // La página puede solicitar estas métricas varias veces. Conservar el
+    // resultado durante la misma petición evita repetir toda la consulta.
+    if (isset($cache_resultados[$user_id])) {
+        return $cache_resultados[$user_id];
     }
 
     $hoy_timestamp = strtotime(wp_date('Y-m-d'));
@@ -3131,18 +3141,93 @@ function cocum_calcular_cobranza_actual_usuario($user_id) {
             continue;
         }
 
-        $cliente_id = intval(get_field('id_cliente_cuenta', $miscuenta_id));
+        $normalizar_id = static function ($valor) {
+            if (is_array($valor)) {
+                $valor = reset($valor);
+            }
+            if (is_object($valor) && isset($valor->ID)) {
+                $valor = $valor->ID;
+            }
+            return intval($valor);
+        };
+
+        $cliente_raw = get_post_meta($miscuenta_id, 'id_cliente_cuenta', true);
+        if (empty($cliente_raw)) {
+            $cliente_raw = get_field('id_cliente_cuenta', $miscuenta_id);
+        }
+        $cliente_id = $normalizar_id($cliente_raw);
         $valor_cuota = 0.0;
         if ($cliente_id > 0) {
             $valor_cuota = floatval(get_field('valor_cuota_cliente', $cliente_id));
         }
+
+        // Resolver el cliente agrupador visible de gd_place. Esta información
+        // no modifica el cálculo: únicamente explica en el popup dónde se
+        // muestra cada cuenta o por qué no puede vincularse al listado.
+        $gd_place_id = 0;
+        if ($cliente_id > 0 && get_post_type($cliente_id) === 'gd_place') {
+            $gd_place_id = $cliente_id;
+        } elseif ($cliente_id > 0) {
+            $gd_raw = get_post_meta($cliente_id, 'id_lista_cliente', true);
+            if (empty($gd_raw)) {
+                $gd_raw = get_post_meta($cliente_id, 'field_6371dda213f5d', true);
+            }
+            if (empty($gd_raw)) {
+                $gd_raw = get_field('id_lista_cliente', $cliente_id);
+            }
+            $gd_place_id = $normalizar_id($gd_raw);
+        }
+
+        $problema_vinculo = '';
+        if ($cliente_id <= 0) {
+            $problema_vinculo = 'Falta id_cliente_cuenta';
+        } elseif (!get_post($cliente_id)) {
+            $problema_vinculo = 'El registro cliente no existe';
+        } elseif ($gd_place_id <= 0) {
+            $problema_vinculo = 'Falta vínculo con el cliente del listado';
+        } elseif (get_post_type($gd_place_id) !== 'gd_place') {
+            $problema_vinculo = 'El vínculo no apunta a gd_place';
+        } elseif (get_post_status($gd_place_id) !== 'publish') {
+            $problema_vinculo = 'El cliente del listado no está publicado';
+        } elseif (intval(get_post_field('post_author', $gd_place_id)) !== $user_id) {
+            $problema_vinculo = 'El cliente del listado pertenece a otro usuario';
+        }
+
+        $nombre_visible = $gd_place_id > 0 ? get_the_title($gd_place_id) : '';
+        if ($nombre_visible === '' && $cliente_id > 0) {
+            $nombre_visible = get_the_title($cliente_id);
+        }
+        if ($nombre_visible === '') {
+            $nombre_visible = get_the_title($miscuenta_id);
+        }
+
+        $detalle_cuenta = array(
+            'miscuenta_id'     => $miscuenta_id,
+            'cliente_id'       => $cliente_id,
+            'gd_place_id'      => $gd_place_id,
+            'nombre'           => $nombre_visible !== '' ? $nombre_visible : 'Sin nombre',
+            'cuota'            => round($valor_cuota, 2),
+            'fecha_proxima'    => $fecha_prox_ymd,
+            'problema_vinculo' => $problema_vinculo,
+        );
+
+        // Una cuenta sin vínculo verificable queda fuera de las métricas de
+        // Reporte Diario. No suma cantidad ni cuota; solamente se conserva
+        // como observación para que administración la corrija manualmente.
+        if ($problema_vinculo !== '') {
+            $resultado['observaciones'][] = $detalle_cuenta;
+            continue;
+        }
+
         $resultado['cantidad']++;
         $resultado['total_cuotas'] += $valor_cuota;
         $resultado['cuentas_ids'][] = $miscuenta_id;
+        $resultado['detalles'][] = $detalle_cuenta;
     }
 
     $resultado['total_cuotas'] = round($resultado['total_cuotas'], 2);
-    return $resultado;
+    $cache_resultados[$user_id] = $resultado;
+    return $cache_resultados[$user_id];
 }
 
 /**
@@ -11765,6 +11850,219 @@ function restringir_acceso_cobranza_web() {
 // Lo ejecutamos en admin_init para proteger el panel...
 add_action('admin_init', 'restringir_acceso_cobranza_web');
 
+
+/**
+ * Popup de detalle para el número "Clientes a cobrar" del reporte de hoy.
+ * Usa exactamente el mismo resultado que guarda el número del reporte.
+ */
+add_action('admin_footer', function () {
+    $screen = function_exists('get_current_screen') ? get_current_screen() : null;
+    if (!$screen || $screen->post_type !== 'reporte_diario') {
+        return;
+    }
+
+    $user_id = get_current_user_id();
+    $metricas = cocum_calcular_cobranza_actual_usuario($user_id);
+    $detalles = isset($metricas['detalles']) && is_array($metricas['detalles'])
+        ? $metricas['detalles']
+        : array();
+    $observaciones = isset($metricas['observaciones']) && is_array($metricas['observaciones'])
+        ? $metricas['observaciones']
+        : array();
+
+    $hoy = wp_date('Y-m-d');
+    $reportes_hoy = get_posts(array(
+        'post_type'      => 'reporte_diario',
+        'author'         => $user_id,
+        'posts_per_page' => -1,
+        'post_status'    => array('publish', 'future'),
+        'fields'         => 'ids',
+        'no_found_rows'  => true,
+        'date_query'     => array(array(
+            'year'  => intval(substr($hoy, 0, 4)),
+            'month' => intval(substr($hoy, 5, 2)),
+            'day'   => intval(substr($hoy, 8, 2)),
+        )),
+    ));
+
+    $grupos = array();
+    foreach ($detalles as $detalle) {
+        $clave = intval($detalle['gd_place_id']) > 0
+            ? 'gd_' . intval($detalle['gd_place_id'])
+            : 'sin_' . intval($detalle['miscuenta_id']);
+        if (!isset($grupos[$clave])) {
+            $grupos[$clave] = array(
+                'nombre'   => (string) $detalle['nombre'],
+                'gd_id'    => intval($detalle['gd_place_id']),
+                'cuentas'  => array(),
+            );
+        }
+        $grupos[$clave]['cuentas'][] = $detalle;
+    }
+    uasort($grupos, static function ($a, $b) {
+        return strcasecmp($a['nombre'], $b['nombre']);
+    });
+    ?>
+    <style>
+        #cocum-popup-clientes-overlay{display:none;position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,.42);padding:28px;box-sizing:border-box;align-items:center;justify-content:center}
+        #cocum-popup-clientes-overlay.cocum-abierto{display:flex}
+        #cocum-popup-clientes{background:#fff;width:min(920px,100%);max-height:88vh;overflow:auto;border-radius:9px;box-shadow:0 15px 45px rgba(0,0,0,.3);position:relative}
+        .cocum-popup-encabezado{position:sticky;top:0;background:#fff;border-bottom:1px solid #dcdcde;padding:17px 52px 14px 20px;z-index:2}
+        .cocum-popup-encabezado h2{margin:0 0 5px;font-size:19px}
+        .cocum-popup-encabezado p{margin:0;color:#50575e}
+        .cocum-popup-cerrar{position:absolute;right:14px;top:12px;border:0;background:transparent;font-size:29px;line-height:1;cursor:pointer;color:#50575e}
+        .cocum-popup-contenido{padding:16px 20px 22px}
+        .cocum-popup-grupo{margin:0 0 16px;border:1px solid #dcdcde;border-radius:6px;overflow:hidden}
+        .cocum-popup-grupo h3{margin:0;padding:9px 11px;background:#f6f7f7;font-size:14px}
+        .cocum-popup-tabla{width:100%;border-collapse:collapse}
+        .cocum-popup-tabla th,.cocum-popup-tabla td{text-align:left;padding:8px 10px;border-top:1px solid #eee;vertical-align:top}
+        .cocum-popup-tabla th{font-size:11px;color:#50575e;background:#fafafa}
+        .cocum-vinculo-ok{color:#008a20;font-weight:600}
+        .cocum-vinculo-error{color:#b32d2e;font-weight:600}
+        .cocum-clientes-vacio{padding:18px;background:#f6f7f7;border-radius:6px}
+        .cocum-popup-observaciones{margin-top:20px;border:2px solid #dba617;border-radius:6px;overflow:hidden;background:#fffaf0}
+        .cocum-popup-observaciones h3{margin:0;padding:10px 12px;background:#fcf0c8;color:#674e00;font-size:14px}
+        .cocum-popup-observaciones>p{margin:10px 12px;color:#674e00}
+        .cocum-abrir-clientes{cursor:pointer}
+        @media(max-width:700px){#cocum-popup-clientes-overlay{padding:10px}.cocum-popup-contenido{padding:12px}.cocum-popup-tabla{font-size:11px}.cocum-popup-tabla th,.cocum-popup-tabla td{padding:6px}}
+    </style>
+
+    <div id="cocum-popup-clientes-overlay" role="dialog" aria-modal="true" aria-labelledby="cocum-popup-clientes-titulo">
+        <div id="cocum-popup-clientes">
+            <div class="cocum-popup-encabezado">
+                <button type="button" class="cocum-popup-cerrar" aria-label="Cerrar">&times;</button>
+                <h2 id="cocum-popup-clientes-titulo">Clientes a cobrar hoy</h2>
+                <p>
+                    <strong><?php echo intval($metricas['cantidad']); ?> cuentas</strong>
+                    · Total de cuotas: <strong>$<?php echo esc_html(number_format((float) $metricas['total_cuotas'], 2)); ?></strong>
+                    · <?php echo esc_html(wp_date('d/m/Y')); ?>
+                </p>
+            </div>
+            <div class="cocum-popup-contenido">
+                <?php if (empty($grupos)) : ?>
+                    <div class="cocum-clientes-vacio">No hay cuentas pendientes de cobro hoy.</div>
+                <?php else : ?>
+                    <?php foreach ($grupos as $grupo) : ?>
+                        <section class="cocum-popup-grupo">
+                            <h3>
+                                <?php echo esc_html($grupo['nombre']); ?>
+                                (<?php echo intval(count($grupo['cuentas'])); ?> por cobrar)
+                                <?php if ($grupo['gd_id'] > 0) : ?>
+                                    · ID listado: <?php echo intval($grupo['gd_id']); ?>
+                                <?php endif; ?>
+                            </h3>
+                            <table class="cocum-popup-tabla">
+                                <thead><tr><th>ID cuenta</th><th>ID cliente</th><th>Próximo cobro</th><th>Cuota</th><th>Vínculo</th></tr></thead>
+                                <tbody>
+                                <?php foreach ($grupo['cuentas'] as $cuenta) : ?>
+                                    <tr>
+                                        <td><?php echo intval($cuenta['miscuenta_id']); ?></td>
+                                        <td><?php echo intval($cuenta['cliente_id']); ?></td>
+                                        <td><?php echo esc_html($cuenta['fecha_proxima'] !== '' ? $cuenta['fecha_proxima'] : 'Sin fecha'); ?></td>
+                                        <td>$<?php echo esc_html(number_format((float) $cuenta['cuota'], 2)); ?></td>
+                                        <td>
+                                            <?php if ($cuenta['problema_vinculo'] === '') : ?>
+                                                <span class="cocum-vinculo-ok">Correcto</span>
+                                            <?php else : ?>
+                                                <span class="cocum-vinculo-error"><?php echo esc_html($cuenta['problema_vinculo']); ?></span>
+                                            <?php endif; ?>
+                                        </td>
+                                    </tr>
+                                <?php endforeach; ?>
+                                </tbody>
+                            </table>
+                        </section>
+                    <?php endforeach; ?>
+                <?php endif; ?>
+
+                <?php if (!empty($observaciones)) : ?>
+                    <section class="cocum-popup-observaciones">
+                        <h3>⚠ Observaciones para administración — cuentas excluidas del cálculo</h3>
+                        <p>
+                            Estas cuentas no suman en <strong>Clientes a cobrar</strong> ni en
+                            <strong>Cobrar día actual</strong> porque su vínculo está incompleto.
+                            Deben revisarse y corregirse manualmente.
+                        </p>
+                        <table class="cocum-popup-tabla">
+                            <thead><tr><th>Nombre</th><th>ID cuenta</th><th>ID cliente</th><th>ID listado</th><th>Próximo cobro</th><th>Motivo</th></tr></thead>
+                            <tbody>
+                            <?php foreach ($observaciones as $cuenta) : ?>
+                                <tr>
+                                    <td><?php echo esc_html($cuenta['nombre']); ?></td>
+                                    <td><?php echo intval($cuenta['miscuenta_id']); ?></td>
+                                    <td><?php echo intval($cuenta['cliente_id']); ?></td>
+                                    <td><?php echo intval($cuenta['gd_place_id']); ?></td>
+                                    <td><?php echo esc_html($cuenta['fecha_proxima'] !== '' ? $cuenta['fecha_proxima'] : 'Sin fecha'); ?></td>
+                                    <td><span class="cocum-vinculo-error"><?php echo esc_html($cuenta['problema_vinculo']); ?></span></td>
+                                </tr>
+                            <?php endforeach; ?>
+                            </tbody>
+                        </table>
+                    </section>
+                <?php endif; ?>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function () {
+        const idsReporteHoy = <?php echo wp_json_encode(array_map('intval', $reportes_hoy)); ?>;
+        const overlay = document.getElementById('cocum-popup-clientes-overlay');
+        if (!overlay || !idsReporteHoy.length) return;
+
+        // El botón de comisión se crea desde otro bloque después de cargar el
+        // DOM. Esperamos a que exista y colocamos a su lado un <button> real.
+        // Así no le afecta la regla del tema que oculta enlaces page-title-action.
+        let intentosBoton = 0;
+        const colocarBotonClientes = function () {
+            if (document.getElementById('cocum-boton-ver-clientes')) return true;
+
+            const botonComision = document.getElementById('btn-open-comision');
+            if (!botonComision) return false;
+
+            const botonClientes = document.createElement('button');
+            botonClientes.type = 'button';
+            botonClientes.id = 'cocum-boton-ver-clientes';
+            botonClientes.className = 'page-title-action cocum-abrir-clientes';
+            botonClientes.textContent = 'Ver clientes a cobrar (<?php echo intval($metricas['cantidad']); ?>)';
+            botonClientes.title = 'Ver las cuentas incluidas en el reporte de hoy';
+            botonClientes.style.setProperty('display', 'inline-block', 'important');
+            botonClientes.style.setProperty('margin-left', '8px', 'important');
+            botonClientes.style.setProperty('vertical-align', 'middle', 'important');
+            botonComision.insertAdjacentElement('afterend', botonClientes);
+            return true;
+        };
+
+        if (!colocarBotonClientes()) {
+            const esperaBoton = window.setInterval(function () {
+                intentosBoton++;
+                if (colocarBotonClientes() || intentosBoton >= 50) {
+                    window.clearInterval(esperaBoton);
+                }
+            }, 100);
+        }
+
+        document.addEventListener('click', function (event) {
+            if (event.target.closest('.cocum-abrir-clientes')) {
+                event.preventDefault();
+                overlay.classList.add('cocum-abierto');
+                document.body.style.overflow = 'hidden';
+            }
+            if (event.target === overlay || event.target.closest('.cocum-popup-cerrar')) {
+                overlay.classList.remove('cocum-abierto');
+                document.body.style.overflow = '';
+            }
+        });
+        document.addEventListener('keydown', function (event) {
+            if (event.key === 'Escape') {
+                overlay.classList.remove('cocum-abierto');
+                document.body.style.overflow = '';
+            }
+        });
+    });
+    </script>
+    <?php
+}, 1000);
 
 // Add block patterns
 require get_template_directory() . '/inc/block-patterns.php';
