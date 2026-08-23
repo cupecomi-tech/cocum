@@ -13179,6 +13179,10 @@ add_action('wp_ajax_cocum_buscar_reportes_fallidos', function () {
         'post_status'    => 'publish',
         'fields'         => 'ids',
         'no_found_rows'  => true,
+        // Si existen fotografías duplicadas del mismo día, procesar primero
+        // la más reciente para que sea la referencia del diagnóstico.
+        'orderby'        => 'date',
+        'order'          => 'DESC',
         'date_query'     => array(
             array(
                 'after'     => $inicio . ' 00:00:00',
@@ -13191,7 +13195,10 @@ add_action('wp_ajax_cocum_buscar_reportes_fallidos', function () {
     $reportes_por_fecha = array();
     foreach ($reportes_ids as $reporte_id) {
         $fecha_reporte = get_the_date('Y-m-d', intval($reporte_id));
-        if ($fecha_reporte !== '') {
+        // La consulta viene de la fotografía más reciente a la más antigua.
+        // Conservar solamente la primera de cada fecha evita que un duplicado
+        // antiguo (por ejemplo, uno guardado en $0) reemplace al reporte bueno.
+        if ($fecha_reporte !== '' && !isset($reportes_por_fecha[$fecha_reporte])) {
             $reportes_por_fecha[$fecha_reporte] = array(
                 'id'            => intval($reporte_id),
                 'total_cobrado' => floatval(get_field('total_cobrado', intval($reporte_id))),
@@ -13429,7 +13436,7 @@ add_action('admin_footer', function () {
     <div id="cocum-fallidos-overlay" role="dialog" aria-modal="true" aria-labelledby="cocum-fallidos-titulo">
         <div id="cocum-fallidos-modal">
             <div style="margin-bottom:12px;padding:10px 12px;background:#e7f5ff;border-left:4px solid #2271b1;font-size:16px;font-weight:700;color:#135e96;">
-                HOLA — versión de prueba actualizada
+                HOLA — versión con duplicados corregidos
             </div>
             <div class="cocum-fallidos-cabecera">
                 <h2 id="cocum-fallidos-titulo">Reportes fallidos</h2>
