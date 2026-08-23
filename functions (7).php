@@ -1330,7 +1330,9 @@ function sincronizar_datos_economicos_pago($idPost_cuentas) {
     $contadorPagos = 0;
     $totalPagado = 0;
     $totalPagadoHoy = 0;
-    $hoy = date("d/m/Y");
+    // Usar siempre la zona horaria configurada en WordPress. date() puede usar
+    // la zona horaria del servidor y considerar que ya es el día siguiente.
+    $hoy = wp_date("d/m/Y");
     $ultima_fecha_pago = '';
     
     // Obtenemos los pagos que han sido cubiertos por abonos o saldos extras (campo 'cubrePagos')
@@ -1377,7 +1379,7 @@ function sincronizar_datos_economicos_pago($idPost_cuentas) {
 
     // Días de atraso
     $fecha_prestamo = get_the_date('Y-m-d', $idPost_cuentas);
-    $hoy_date = date("Y-m-d");
+    $hoy_date = wp_date("Y-m-d");
     $intervalo = date_diff(date_create($fecha_prestamo), date_create($hoy_date));
     $dias_transcurridos = intval($intervalo->format('%R%a'));
     $diasAtrasados = max(0, $dias_transcurridos - $contadorPagos);
@@ -1399,7 +1401,7 @@ function sincronizar_datos_economicos_pago($idPost_cuentas) {
     // MODIFICADO: No sobreescribir si ya existe una fecha válida y no hay pagos nuevos
     if (!$fecha_prox_cobro_db) {
         $fecha_existente = get_post_meta($idPost_cuentas, 'fecha_prox_cobro', true);
-        $fecha_prox_cobro_db = !empty($fecha_existente) ? $fecha_existente : date('Y-m-d');
+        $fecha_prox_cobro_db = !empty($fecha_existente) ? $fecha_existente : wp_date('Y-m-d');
     }
 
     // CÁLCULO DE PAGOS HOY (Sincronizado con la lógica de abonos)
@@ -1411,7 +1413,11 @@ function sincronizar_datos_economicos_pago($idPost_cuentas) {
             array('key' => 'id_cliente', 'value' => $idPost_cuentas, 'compare' => '='),
         ),
         'date_query' => array(
-            array('year' => date('Y'), 'month' => date('m'), 'day' => date('d'))
+            array(
+                'year'  => intval(wp_date('Y')),
+                'month' => intval(wp_date('m')),
+                'day'   => intval(wp_date('d')),
+            )
         )
     ));
     
@@ -1692,9 +1698,9 @@ function obtener_cuentas(){
                      }
 
                      
-                     $hoy_pago_registro = date("d/m/Y");
+                     $hoy_pago_registro = wp_date("d/m/Y");
                      
-                     $diaSiguientee =   date("Y-m-d", strtotime("+1 day"));
+                     $diaSiguientee = wp_date("Y-m-d", strtotime("+1 day"));
  
               
 
@@ -3299,8 +3305,10 @@ function reporte_diario(){
                $sumaAbonos = 0;
                 $bandAbono=0;
                 $sumaTotalesHoy_sumaTotalesAbonos=0;
-     	             $hoyReporte = date("d/m/Y");
-     	             $hoyGasto = date("d/m/Y");
+     	             // La fotografía y los movimientos deben compartir la zona
+     	             // horaria de WordPress para no desplazar cobros al día siguiente.
+     	             $hoyReporte = wp_date("d/m/Y");
+     	             $hoyGasto = wp_date("d/m/Y");
      	            
      	            
      	           $current_useR = wp_get_current_user();
@@ -3324,9 +3332,9 @@ function reporte_diario(){
     'order' => 'DESC',
     'date_query' => array(
         array(
-            'year' => date('Y'),
-            'month' => date('m'),
-            'day' => date('d'),
+            'year'  => intval(wp_date('Y')),
+            'month' => intval(wp_date('m')),
+            'day'   => intval(wp_date('d')),
         ),
     ),
      );
@@ -3515,9 +3523,9 @@ function reporte_diario(){
                             'order'          => 'DESC',
                             'date_query'     => array(
                                 array(
-                                    'year'  => date('Y'),
-                                    'month' => date('m'),
-                                    'day'   => date('d'),
+                                    'year'  => intval(wp_date('Y')),
+                                    'month' => intval(wp_date('m')),
+                                    'day'   => intval(wp_date('d')),
                                 ),
                             ),
                            's'              => ' - NL', // Buscar títulos que terminen con " - NL"
@@ -10523,27 +10531,29 @@ function agrupar_nombres_repetidos_en_admin() {
         return;
     }
 
-    // ⚠️ Ejecutar SOLO cuando lst_clnt=1
-    if (!isset($_GET['lst_clnt']) || $_GET['lst_clnt'] != '1') {
-        return; 
-    }
+    // También ejecutar en la pantalla normal edit.php?post_type=gd_place.
+    // El menú actual de Clientes a Cobrar ya no añade lst_clnt=1 y esa
+    // condición impedía mostrar el contador de cuentas junto al nombre.
 
     $status_by_post_id = [];
     $financial_mode_by_post_id = [];
-    global $wp_query;
-    $listed_gd_ids = [];
-    if (isset($wp_query->posts) && is_array($wp_query->posts)) {
-        foreach ($wp_query->posts as $listed_post) {
-            if (!isset($listed_post->ID)) {
-                continue;
-            }
-            $post_id = intval($listed_post->ID);
-            if ($post_id <= 0) {
-                continue;
-            }
-            $listed_gd_ids[] = $post_id;
-            $status_by_post_id[$post_id] = strtolower(trim((string) get_post_meta($post_id, 'cuentaGD', true)));
+    // No depender de $wp_query en admin_footer: otros componentes del listado
+    // pueden haber reemplazado esa consulta antes de que se dibuje el contador.
+    // Obtener directamente los clientes principales del usuario conectado.
+    $listed_gd_ids = get_posts([
+        'post_type'      => 'gd_place',
+        'post_status'    => 'publish',
+        'author'         => get_current_user_id(),
+        'fields'         => 'ids',
+        'posts_per_page' => -1,
+        'no_found_rows'  => true,
+    ]);
+    $listed_gd_ids = array_values(array_unique(array_map('intval', $listed_gd_ids)));
+    foreach ($listed_gd_ids as $post_id) {
+        if ($post_id <= 0) {
+            continue;
         }
+        $status_by_post_id[$post_id] = strtolower(trim((string) get_post_meta($post_id, 'cuentaGD', true)));
     }
 
     $gd_financial_stats = [];
@@ -10573,9 +10583,13 @@ function agrupar_nombres_repetidos_en_admin() {
     }
 
     $normalize_related_id = static function($raw_value) {
+        if (is_string($raw_value)) {
+            $raw_value = maybe_unserialize($raw_value);
+        }
         if (is_array($raw_value)) {
             $raw_value = reset($raw_value);
-        } elseif (is_object($raw_value) && isset($raw_value->ID)) {
+        }
+        if (is_object($raw_value) && isset($raw_value->ID)) {
             $raw_value = $raw_value->ID;
         }
 
@@ -10747,6 +10761,23 @@ function agrupar_nombres_repetidos_en_admin() {
         }
         $financial_mode_by_post_id[$gd_id] = 'pending';
     }
+
+    // Usar exactamente la misma fuente y condiciones que "Clientes a Cobrar".
+    // Esta función aplica estado activo, fecha de alta, próxima fecha de cobro,
+    // usuario y vínculo válido. Además conserva caché durante la misma petición.
+    // Contar directamente por el ID del cliente principal. Evitamos relacionar
+    // por nombre porque los títulos pueden ser modificados por filtros de WP.
+    $account_count_by_post_id = array_fill_keys($listed_gd_ids, 0);
+    $cobranza_para_contador = cocum_calcular_cobranza_actual_usuario(get_current_user_id());
+    $cuentas_para_contador = isset($cobranza_para_contador['detalles']) && is_array($cobranza_para_contador['detalles'])
+        ? $cobranza_para_contador['detalles']
+        : [];
+    foreach ($cuentas_para_contador as $detalle_cuenta) {
+        $gd_place_id = isset($detalle_cuenta['gd_place_id']) ? intval($detalle_cuenta['gd_place_id']) : 0;
+        if ($gd_place_id > 0 && array_key_exists($gd_place_id, $account_count_by_post_id)) {
+            $account_count_by_post_id[$gd_place_id]++;
+        }
+    }
     ?>
     <style>
         /* Estilo para el toggle de duplicados */
@@ -10774,6 +10805,8 @@ function agrupar_nombres_repetidos_en_admin() {
         const defaultMode = 'all';
         const statusByPostId = <?php echo wp_json_encode($status_by_post_id); ?> || {};
         const modeByPostId = <?php echo wp_json_encode($financial_mode_by_post_id); ?> || {};
+        const accountCountByPostId = <?php echo wp_json_encode($account_count_by_post_id); ?> || {};
+        const isListadoClientes = <?php echo (isset($_GET['lst_clnt']) && (string) $_GET['lst_clnt'] === '1') ? 'true' : 'false'; ?>;
         let detectedStatusColumnClass = '';
         let detectedDateColumnClass = '';
 
@@ -10905,19 +10938,44 @@ function agrupar_nombres_repetidos_en_admin() {
             rows.find('.duplicado-toggle').remove();
 
             groupedClients.forEach(function(clientRows) {
-                const rowToDisplay = getRowByMode(clientRows, mode);
+                // "Clientes a Cobrar" comparte el post type gd_place con el
+                // listado general, pero aquí solo deben verse clientes que
+                // tengan al menos una cuenta que cumple las reglas de cobro.
+                const eligibleRows = isListadoClientes
+                    ? clientRows
+                    : clientRows.filter(function(rowItem) {
+                        return Number(accountCountByPostId[rowItem.postId] || 0) > 0;
+                    });
+                const rowToDisplay = getRowByMode(eligibleRows, mode);
                 if (!rowToDisplay) return;
 
                 rowToDisplay.$row.show();
 
-                if (clientRows.length > 1) {
-                    const $titleCell = rowToDisplay.$row.find('td.title.column-title');
-                    const toggle = $('<div class="duplicado-toggle">(' + clientRows.length + ' cuentas)</div>');
-                    $titleCell.append(toggle);
+                const accountCount = Number(accountCountByPostId[rowToDisplay.postId] || 0);
+                if (accountCount > 0) {
+                    const accountLabel = accountCount === 1 ? 'cuenta' : 'cuentas';
+                    const $titleLink = rowToDisplay.$row.find('a.row-title').first();
+                    const $titleCell = rowToDisplay.$row
+                        .find('td.column-post_title, td.title.column-title, td.column-title, td.title, td.column-primary')
+                        .first();
+                    const toggle = $('<span class="duplicado-toggle">(' + accountCount + ' ' + accountLabel + ')</span>');
+
+                    // GeoDirectory puede cambiar la clase de la columna del
+                    // título. El enlace row-title es el punto más estable.
+                    if ($titleLink.length) {
+                        $titleLink.after(toggle);
+                    } else if ($titleCell.length) {
+                        $titleCell.append(toggle);
+                    } else {
+                        rowToDisplay.$row.find('td').first().append(toggle);
+                    }
                 }
             });
 
-            setActiveButton(mode);
+            if (isListadoClientes) {
+                setActiveButton(mode);
+            }
+
         }
 
         detectedStatusColumnClass = getColumnClassByKeywords(
@@ -10934,9 +10992,9 @@ function agrupar_nombres_repetidos_en_admin() {
             const rowMode = Number.isNaN(rowPostId) ? '' : normalizeText(modeByPostId[rowPostId]);
             const cuentaText = metaStatus || extractStatusText($row);
             const fechaTextRaw = extractDateText($row);
-            let $link = $row.find('td.title.column-title a.row-title').first();
+            let $link = $row.find('a.row-title').first();
             if (!$link.length) {
-                $link = $row.find('td.title.column-title a').first();
+                $link = $row.find('td.column-post_title a, td.title.column-title a, td.column-title a, td.title a, td.column-primary a').first();
             }
 
             // Si esta fila corresponde a una cuenta terminada, el clic en el
@@ -10969,33 +11027,36 @@ function agrupar_nombres_repetidos_en_admin() {
 
             groupedClients.get(key).push({
                 $row: $row,
+                postId: Number.isNaN(rowPostId) ? 0 : rowPostId,
                 status: cuentaText,
                 mode: rowMode,
                 date: publicationDate
             });
         });
 
-        const $h1 = $('body.post-type-gd_place .wrap h1');
-        if ($h1.length) {
-            const buttons = [
-                { mode: 'all', label: 'Todos' },
-                { mode: 'pending', label: 'Con Pagos Pendientes' },
-                { mode: 'terminated', label: 'Terminados' },
-                { mode: 'registered', label: 'Solo Registrados' }
-            ];
-
-            const $filters = $('<span id="cocum-gd-filters" style="margin-left:10px;"></span>');
-
-            buttons.forEach(function(btn) {
-                const $button = $('<a href="#" class="page-title-action" data-mode="' + btn.mode + '" style="margin-left:6px;">' + btn.label + '</a>');
-                $button.on('click', function(e) {
-                    e.preventDefault();
-                    applyFilter(btn.mode);
+        // Los filtros pertenecen únicamente a "Listado de Clientes", cuya URL
+        // incluye lst_clnt=1. "Clientes a Cobrar" usa el mismo post type, pero
+        // no debe recibir estos botones.
+        if (isListadoClientes) {
+            const $h1 = $('body.post-type-gd_place .wrap h1');
+            if ($h1.length) {
+                const buttons = [
+                    { mode: 'all', label: 'Todos' },
+                    { mode: 'pending', label: 'Con Pagos Pendientes' },
+                    { mode: 'terminated', label: 'Terminados' },
+                    { mode: 'registered', label: 'Solo Registrados' }
+                ];
+                const $filters = $('<span id="cocum-gd-filters" style="margin-left:10px;"></span>');
+                buttons.forEach(function(btn) {
+                    const $button = $('<a href="#" class="page-title-action" data-mode="' + btn.mode + '" style="margin-left:6px;">' + btn.label + '</a>');
+                    $button.on('click', function(e) {
+                        e.preventDefault();
+                        applyFilter(btn.mode);
+                    });
+                    $filters.append($button);
                 });
-                $filters.append($button);
-            });
-
-            $h1.append($filters);
+                $h1.append($filters);
+            }
         }
 
         applyFilter(defaultMode);
@@ -13436,7 +13497,7 @@ add_action('admin_footer', function () {
     <div id="cocum-fallidos-overlay" role="dialog" aria-modal="true" aria-labelledby="cocum-fallidos-titulo">
         <div id="cocum-fallidos-modal">
             <div style="margin-bottom:12px;padding:10px 12px;background:#e7f5ff;border-left:4px solid #2271b1;font-size:16px;font-weight:700;color:#135e96;">
-                HOLA — versión con duplicados corregidos
+                HOLA — versión paréntesis junto al nombre
             </div>
             <div class="cocum-fallidos-cabecera">
                 <h2 id="cocum-fallidos-titulo">Reportes fallidos</h2>
